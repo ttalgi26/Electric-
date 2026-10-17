@@ -1,0 +1,46 @@
+name: Build Windows app
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyInstaller
+        run: python -m pip install pyinstaller
+      - name: Smoke test (command line)
+        run: python power_calc.py --auto
+      - name: Smoke test (window)
+        shell: python
+        run: |
+          import os, sys
+          sys.path.insert(0, os.getcwd())
+          import app
+          a = app.App()
+          def check():
+              if a.detect_btn.instate(["disabled"]) or a._calc_job:
+                  a.after(500, check)
+                  return
+              print(a.info_label.cget("text"))
+              print(a.usage_label.cget("text"))
+              for i in a.part_tree.get_children():
+                  print(a.part_tree.item(i)["values"])
+              print(a.summary.cget("text"))
+              a.destroy()
+          a.after(1000, check)
+          a.after(180000, a.destroy)
+          a.mainloop()
+      - name: Build exe
+        run: python -m PyInstaller --onefile --windowed --name PCPowerCalc app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PCPowerCalc-windows
+          path: dist/PCPowerCalc.exe
