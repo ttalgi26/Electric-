@@ -1,0 +1,19 @@
+{
+  "parts": [
+    {"name": "Ryzen 5 7600", "idle_w": 15, "load_w": 120},
+    {"name": "RTX 4070", "idle_w": 12, "load_w": 220},
+    {"name": "메인보드", "idle_w": 20, "load_w": 40},
+    {"name": "RAM", "idle_w": 2, "load_w": 4, "count": 2},
+    {"name": "SSD", "idle_w": 1, "load_w": 6, "count": 1},
+    {"name": "케이스 팬", "idle_w": 1, "load_w": 3, "count": 3},
+    {"name": "27인치 모니터", "idle_w": 25, "load_w": 40, "count": 1, "external": true}
+  ],
+  "usage": {
+    "light_hours": 4,
+    "heavy_hours": 2,
+    "days_per_week": 7,
+    "standby_w": 2
+  },
+  "psu_efficiency": 0.85,
+  "price_per_kwh": 150
+}
