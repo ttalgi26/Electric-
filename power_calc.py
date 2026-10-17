@@ -19,6 +19,7 @@ import json
 import sys
 import unicodedata
 
+import monitor
 import tariff
 
 # 부품 프리셋: (이름, 유휴 W, 최대 W). 값은 대표적인 실측 기준의 근사치다.
@@ -50,20 +51,25 @@ COUNTED_PARTS = {
     "fan": ("케이스 팬 (개)", 1, 3),
 }
 
+# 모니터 프리셋: (이름, 크기, 해상도, 주사율)
 MONITOR_PRESETS = [
-    ("모니터 없음 / 계산 제외", 0, 0),
-    ("24인치 모니터", 18, 25),
-    ("27인치 모니터", 25, 40),
-    ("32인치 이상 / 고주사율 모니터", 35, 60),
+    ("24인치 FHD 60Hz", 24, "1920x1080", 60),
+    ("27인치 QHD 144Hz", 27, "2560x1440", 144),
+    ("27인치 4K 60Hz", 27, "3840x2160", 60),
+    ("32인치 4K 144Hz", 32, "3840x2160", 144),
+    ("34인치 울트라와이드 144Hz", 34, "3440x1440", 144),
 ]
 
 DEFAULT_CONFIG = {
     "parts": [],
+    "monitors": [],             # monitor.make_spec() 형식
+    "activities": [],           # 전력 테스트 결과로 만든 시간표 [{name, watts, hours}]
     "usage": {
         "light_hours": 4.0,     # 웹서핑/문서작업 시간 (사용하는 날 하루)
         "heavy_hours": 2.0,     # 게임/렌더링 시간 (사용하는 날 하루)
         "days_per_week": 7,     # 주당 사용 일수
-        "standby_w": 2.0,       # 꺼짐/대기 상태 소비전력
+        "standby_w": 2.0,       # 꺼짐/대기 상태 소비전력 (본체)
+        "monitor_on_ratio": 1.0,  # PC 사용 중 모니터 화면이 켜져 있는 비율
     },
     "psu_efficiency": 0.85,     # 파워서플라이 효율 (80 PLUS 브론즈~골드 ≈ 0.85~0.90)
     "light_factor": 0.2,        # 가벼운 작업 시 (최대-유휴) 대비 추가 부하 비율
@@ -89,22 +95,44 @@ def part_power(part, factor):
     return (idle + (peak - idle) * factor) * part.get("count", 1)
 
 
-def daily_kwh(config):
-    """사용하는 날 하루 소비전력량(kWh)과 부품별 하루 소비량을 반환한다."""
-    usage = config["usage"]
-    light_h, heavy_h = usage["light_hours"], usage["heavy_hours"]
-    off_h = max(0.0, 24 - light_h - heavy_h)
-    eff = config["psu_efficiency"]
+def standby_watts(config):
+    """PC가 꺼져 있을 때 본체와 모니터의 대기전력 합(W)."""
+    monitors = sum(m.get("count", 1) for m in config.get("monitors", []))
+    return config["usage"]["standby_w"] + monitor.STANDBY_W * monitors
 
+
+def daily_kwh(config):
+    """사용하는 날 하루 소비전력량(kWh)과 항목별 하루 소비량을 반환한다."""
+    usage = config["usage"]
+    activities = config.get("activities") or []
     per_part = {}
-    for part in config["parts"]:
-        wh = (part_power(part, config["light_factor"]) * light_h
-              + part_power(part, config["heavy_factor"]) * heavy_h)
-        # 모니터는 콘센트에 직접 연결되므로 파워 효율을 적용하지 않는다.
-        if not part.get("external"):
-            wh /= eff
-        per_part[part["name"]] = per_part.get(part["name"], 0) + wh / 1000
-    per_part["대기전력 (꺼짐 상태)"] = usage["standby_w"] * off_h / 1000
+
+    if activities:
+        # 전력 테스트로 측정한 활동별 전력(모니터 포함) × 하루 시간
+        on_h = sum(a["hours"] for a in activities)
+        for a in activities:
+            per_part[f"[측정] {a['name']}"] = a["watts"] * a["hours"] / 1000
+    else:
+        light_h, heavy_h = usage["light_hours"], usage["heavy_hours"]
+        on_h = light_h + heavy_h
+        eff = config["psu_efficiency"]
+        for part in config["parts"]:
+            wh = (part_power(part, config["light_factor"]) * light_h
+                  + part_power(part, config["heavy_factor"]) * heavy_h)
+            # 모니터처럼 콘센트에 직접 연결된 기기는 파워 효율을 적용하지 않는다.
+            if not part.get("external"):
+                wh /= eff
+            per_part[part["name"]] = per_part.get(part["name"], 0) + wh / 1000
+        ratio = usage.get("monitor_on_ratio", 1.0)
+        for spec in config.get("monitors", []):
+            count = spec.get("count", 1)
+            wh = (monitor.monitor_power(spec) * on_h * ratio
+                  + monitor.STANDBY_W * on_h * (1 - ratio)) * count
+            name = f"모니터: {spec['name']}"
+            per_part[name] = per_part.get(name, 0) + wh / 1000
+
+    off_h = max(0.0, 24 - on_h)
+    per_part["대기전력 (꺼짐 상태)"] = standby_watts(config) * off_h / 1000
     return sum(per_part.values()), per_part
 
 
@@ -114,7 +142,7 @@ def monthly_report(config, year):
     usage = config["usage"]
     use_ratio = usage["days_per_week"] / 7
     # 사용하지 않는 날은 대기전력만 소비한다.
-    idle_day = usage["standby_w"] * 24 / 1000
+    idle_day = standby_watts(config) * 24 / 1000
     t = config["tariff"]
     opts = {"climate": t["climate_per_kwh"], "fuel": t["fuel_per_kwh"], "fund_rate": t["fund_rate"]}
 
@@ -156,6 +184,7 @@ def auto_config():
     config = new_config()
     info = hardware.detect()
     config["parts"] = hardware.build_parts(info)
+    config["monitors"] = hardware.build_monitors(info)
     if info.get("laptop"):
         config["usage"]["standby_w"] = 0.5
         config["psu_efficiency"] = 0.88
@@ -211,21 +240,31 @@ def interactive_config():
     parts = config["parts"]
     for key, title in (("cpu", "CPU"), ("gpu", "그래픽카드"), ("motherboard", "메인보드")):
         name, idle, peak = choose(title, PRESETS[key])
-        parts.append({"name": name, "idle_w": idle, "load_w": peak})
+        kind = {"cpu": "cpu", "gpu": "gpu" if peak > 15 else "igpu", "motherboard": "board"}[key]
+        parts.append({"name": name, "kind": kind, "idle_w": idle, "load_w": peak})
 
     print("\n[기타 부품 개수]")
     defaults = {"ram": 2, "ssd": 1, "hdd": 0, "fan": 3}
     for key, (name, idle, peak) in COUNTED_PARTS.items():
         count = ask_int(f"  {name}", defaults[key])
         if count:
-            parts.append({"name": name.split(" (")[0], "idle_w": idle,
+            parts.append({"name": name.split(" (")[0], "kind": key, "idle_w": idle,
                           "load_w": peak, "count": count})
 
-    name, idle, peak = choose("모니터", MONITOR_PRESETS)
-    if peak:
+    print("\n[모니터]")
+    for i, (name, *_rest) in enumerate(MONITOR_PRESETS, 1):
+        print(f"  {i}. {name}")
+    print("  0. 모니터 없음 / 계산 제외")
+    pick = ask_int("번호 선택", 2, 0, len(MONITOR_PRESETS))
+    if pick:
+        name, size, res, hz = MONITOR_PRESETS[pick - 1]
         count = ask_int("  모니터 개수", 1, 1)
-        parts.append({"name": name, "idle_w": idle, "load_w": peak,
-                      "count": count, "external": True})
+        brightness = ask_float("  밝기 (%)", 70.0, 0, 100)
+        oled = ask_int("  패널 (1: LCD, 2: OLED, 3: 미니 LED)", 1, 1, 3)
+        spec = monitor.make_spec(size, res, hz, ("LCD", "OLED", "MINILED")[oled - 1],
+                                 brightness, name=name, count=count)
+        config["monitors"].append(spec)
+        print(f"  → 켜져 있을 때 약 {monitor.monitor_power(spec):g}W (1대)")
 
     print("\n[사용 패턴]")
     u = config["usage"]
@@ -268,6 +307,10 @@ def print_detection(info, detected):
     for label, key in (("CPU", "cpu"), ("GPU", "gpu")):
         for name in info.get(key) or ["감지 실패"]:
             print(f"  {label}: {name}")
+    for mon in info.get("monitors") or []:
+        print(f"  모니터: {mon.get('name') or '이름 미확인'} "
+              f"({mon.get('inches') or '?'}인치, {mon.get('resolution') or '?'}, "
+              f"{mon.get('refresh') or '?'}Hz)")
     if detected:
         print(f"  사용 기록 ({detected['source']}, 최근 {detected['window_days']}일): "
               f"사용한 날 {detected['active_days']}일, "
@@ -289,6 +332,9 @@ def print_report(config, year):
         print(f"  {pad(name, 36)} {kwh * 1000:8.1f} Wh  ({share:4.1f}%)")
     print("-" * 60)
     print(f"  {pad('하루 합계', 36)} {total_day:8.3f} kWh")
+    for spec in config.get("monitors", []):
+        print(f"  모니터 {spec['name']}: {monitor.describe(spec)} → 켜짐 "
+              f"{monitor.monitor_power(spec):g}W × {spec.get('count', 1)}대")
 
     print("\n" + "=" * 60)
     if kepco:

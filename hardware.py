@@ -11,6 +11,8 @@ import platform
 import re
 import subprocess
 
+import monitor
+
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -63,8 +65,17 @@ $r.chassis = @((Get-CimInstance Win32_SystemEnclosure).ChassisTypes | ForEach-Ob
 $conn = @{}
 Get-CimInstance -Namespace root\wmi WmiMonitorConnectionParams | ForEach-Object {
     $conn[$_.InstanceName] = [int64]$_.VideoOutputTechnology }
+$names = @{}
+Get-CimInstance -Namespace root\wmi WmiMonitorID | ForEach-Object {
+    $names[$_.InstanceName] = (($_.UserFriendlyName | Where-Object { $_ -ne 0 } |
+                                ForEach-Object { [char]$_ }) -join '') }
+$bright = @{}
+Get-CimInstance -Namespace root\wmi WmiMonitorBrightness | ForEach-Object {
+    $bright[$_.InstanceName] = [int]$_.CurrentBrightness }
 $r.monitors = @(Get-CimInstance -Namespace root\wmi WmiMonitorBasicDisplayParams | ForEach-Object {
-    [ordered]@{ w = [int]$_.MaxHorizontalImageSize; h = [int]$_.MaxVerticalImageSize;
+    [ordered]@{ id = $_.InstanceName; name = $names[$_.InstanceName];
+                w = [int]$_.MaxHorizontalImageSize; h = [int]$_.MaxVerticalImageSize;
+                brightness = $bright[$_.InstanceName];
                 internal = ($conn[$_.InstanceName] -eq 2147483648) } })
 $r | ConvertTo-Json -Depth 4 -Compress
 """
@@ -76,6 +87,66 @@ def inches(w_cm, h_cm):
     if not w_cm or not h_cm:
         return None
     return round(math.hypot(w_cm, h_cm) / 2.54, 1)
+
+
+def windows_display_modes():
+    """연결된 화면별 (모니터 모델 코드, 해상도, 주사율)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class DISPLAY_DEVICEW(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("DeviceName", wintypes.WCHAR * 32),
+                    ("DeviceString", wintypes.WCHAR * 128), ("StateFlags", wintypes.DWORD),
+                    ("DeviceID", wintypes.WCHAR * 128), ("DeviceKey", wintypes.WCHAR * 128)]
+
+    class DEVMODEW(ctypes.Structure):
+        _fields_ = [("dmDeviceName", wintypes.WCHAR * 32), ("dmSpecVersion", wintypes.WORD),
+                    ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD),
+                    ("dmDriverExtra", wintypes.WORD), ("dmFields", wintypes.DWORD),
+                    ("dmUnion", ctypes.c_byte * 16), ("dmColor", ctypes.c_short),
+                    ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                    ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                    ("dmFormName", wintypes.WCHAR * 32), ("dmLogPixels", wintypes.WORD),
+                    ("dmBitsPerPel", wintypes.DWORD), ("dmPelsWidth", wintypes.DWORD),
+                    ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD), ("dmRest", wintypes.DWORD * 8)]
+
+    user32 = ctypes.windll.user32
+    user32.EnumDisplaySettingsW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                                            ctypes.POINTER(DEVMODEW)]
+    modes, index = [], 0
+    while True:
+        adapter = DISPLAY_DEVICEW(cb=ctypes.sizeof(DISPLAY_DEVICEW))
+        if not user32.EnumDisplayDevicesW(None, index, ctypes.byref(adapter), 0):
+            break
+        index += 1
+        if not adapter.StateFlags & 1:      # DISPLAY_DEVICE_ATTACHED_TO_DESKTOP
+            continue
+        mode = DEVMODEW(dmSize=ctypes.sizeof(DEVMODEW))
+        if not user32.EnumDisplaySettingsW(adapter.DeviceName, 0xFFFFFFFF, ctypes.byref(mode)):
+            continue
+        mon = DISPLAY_DEVICEW(cb=ctypes.sizeof(DISPLAY_DEVICEW))
+        code = None
+        if user32.EnumDisplayDevicesW(adapter.DeviceName, 0, ctypes.byref(mon), 0):
+            m = re.search(r"MONITOR\\([A-Z0-9]+)\\", mon.DeviceID, re.I)
+            code = m.group(1).upper() if m else None
+        modes.append({"code": code, "resolution": f"{mode.dmPelsWidth}x{mode.dmPelsHeight}",
+                      "refresh": mode.dmDisplayFrequency})
+    return modes
+
+
+def match_modes(monitors, modes):
+    """WMI 모니터 목록에 해상도·주사율을 모델 코드로 짝지어 붙인다."""
+    unused = list(modes)
+    for mon in monitors:
+        m = re.search(r"DISPLAY\\([A-Z0-9]+)\\", mon.get("id") or "", re.I)
+        code = m.group(1).upper() if m else None
+        pick = next((x for x in unused if code and x["code"] == code), None)
+        if pick is None and len(unused) == 1 and len(monitors) == 1:
+            pick = unused[0]
+        if pick:
+            unused.remove(pick)
+            mon.update(resolution=pick["resolution"], refresh=pick["refresh"])
 
 
 def detect_windows():
@@ -98,8 +169,13 @@ def detect_windows():
             kind = "HDD" if "HDD" in name.upper() else "SSD"
         disks.append({"name": name, "type": kind})
     laptop = bool(data.get("battery")) or bool(set(as_list(data.get("chassis"))) & LAPTOP_CHASSIS)
-    monitors = [{"inches": inches(m.get("w"), m.get("h"))}
+    monitors = [{"id": m.get("id"), "name": (m.get("name") or "").strip() or None,
+                 "inches": inches(m.get("w"), m.get("h")), "brightness": m.get("brightness")}
                 for m in as_list(data.get("monitors")) if not m.get("internal")]
+    try:
+        match_modes(monitors, windows_display_modes())
+    except (OSError, AttributeError, ValueError):
+        pass
     return {
         "os": "Windows",
         "cpu": as_list(data.get("cpu")),
@@ -110,6 +186,15 @@ def detect_windows():
         "laptop": laptop,
         "monitors": monitors,
     }
+
+
+def edid_name(edid):
+    """EDID 디스크립터에서 모니터 이름(태그 0xFC)을 읽는다."""
+    for start in (54, 72, 90, 108):
+        block = edid[start:start + 18]
+        if len(block) == 18 and block[:3] == b"\0\0\0" and block[3] == 0xFC:
+            return block[5:].split(b"\n")[0].decode("ascii", "ignore").strip() or None
+    return None
 
 
 def detect_linux():
@@ -143,9 +228,12 @@ def detect_linux():
         connector = os.path.basename(os.path.dirname(status))
         if re.search(r"eDP|LVDS|DSI", connector):
             continue
-        edid = read_file(os.path.join(os.path.dirname(status), "edid"), "rb")
-        size = inches(edid[21], edid[22]) if len(edid) > 22 else None
-        monitors.append({"inches": size})
+        base = os.path.dirname(status)
+        edid = read_file(os.path.join(base, "edid"), "rb")
+        modes = read_file(os.path.join(base, "modes")).split()
+        monitors.append({"inches": inches(edid[21], edid[22]) if len(edid) > 22 else None,
+                         "name": edid_name(edid),
+                         "resolution": modes[0] if modes else None})
 
     laptop = bool(glob.glob("/sys/class/power_supply/BAT*"))
     return {
@@ -168,8 +256,13 @@ def detect_mac():
         for card in data.get("SPDisplaysDataType", []):
             gpu.append(card.get("sppci_model", ""))
             for disp in card.get("spdisplays_ndrvs", []):
-                if disp.get("spdisplays_connection_type") != "spdisplays_internal":
-                    monitors.append({"inches": None})
+                if disp.get("spdisplays_connection_type") == "spdisplays_internal":
+                    continue
+                res = re.search(r"(\d+) x (\d+)(?: @ ([\d.]+)\s*Hz)?",
+                                str(disp.get("_spdisplays_resolution", "")))
+                monitors.append({"inches": None, "name": disp.get("_name"),
+                                 "resolution": f"{res.group(1)}x{res.group(2)}" if res else None,
+                                 "refresh": float(res.group(3)) if res and res.group(3) else None})
     except ValueError:
         pass
     total = int(run(["sysctl", "-n", "hw.memsize"]).strip() or 0)
@@ -309,31 +402,20 @@ def estimate_gpu(name):
     return 0, 10, False
 
 
-def monitor_watts(size):
-    size = size or 27
-    if size <= 22:
-        return 14, 20
-    if size <= 25:
-        return 18, 25
-    if size <= 28:
-        return 25, 35
-    if size <= 34:
-        return 35, 50
-    return 45, 70
-
-
 def build_parts(info):
-    """감지 정보를 계산용 부품 목록으로 바꾼다."""
+    """감지 정보를 계산용 부품 목록으로 바꾼다. (모니터는 build_monitors)"""
     laptop = info.get("laptop")
     parts = []
 
     cpus = info.get("cpu") or []
     for name in cpus:
         idle, load = estimate_cpu(name, laptop)
-        parts.append({"name": clean(name), "idle_w": idle, "load_w": load, "note": "자동 감지"})
+        parts.append({"name": clean(name), "kind": "cpu", "idle_w": idle, "load_w": load,
+                      "note": "자동 감지"})
     if not cpus:
         idle, load = (5, 45) if laptop else (15, 120)
-        parts.append({"name": "CPU (감지 실패)", "idle_w": idle, "load_w": load, "note": "기본값"})
+        parts.append({"name": "CPU (감지 실패)", "kind": "cpu", "idle_w": idle, "load_w": load,
+                      "note": "기본값"})
 
     gpus = []
     for name in info.get("gpu") or []:
@@ -343,36 +425,49 @@ def build_parts(info):
     if any(discrete for *_, discrete in gpus):
         gpus = [g for g in gpus if g[3]]     # 외장 GPU가 있으면 내장 그래픽은 제외
     for name, idle, load, discrete in gpus:
-        parts.append({"name": name, "idle_w": idle, "load_w": load,
-                      "note": "자동 감지" if discrete else "내장 그래픽"})
+        parts.append({"name": name, "kind": "gpu" if discrete else "igpu", "idle_w": idle,
+                      "load_w": load, "note": "자동 감지" if discrete else "내장 그래픽"})
 
     if laptop:
-        parts.append({"name": "노트북 본체 (메인보드·내장 화면 등)", "idle_w": 6, "load_w": 15,
-                      "note": "추정값"})
+        parts.append({"name": "노트북 본체 (메인보드·내장 화면 등)", "kind": "board",
+                      "idle_w": 6, "load_w": 15, "note": "추정값"})
     else:
-        parts.append({"name": "메인보드·칩셋", "idle_w": 20, "load_w": 40, "note": "추정값"})
+        parts.append({"name": "메인보드·칩셋", "kind": "board", "idle_w": 20, "load_w": 40,
+                      "note": "추정값"})
 
     modules = info.get("ram_modules") or 0
     if modules:
         gb = f", 총 {info['ram_gb']}GB" if info.get("ram_gb") else ""
         idle, load = (1, 3) if laptop else (2, 4)
-        parts.append({"name": f"RAM{gb}", "idle_w": idle, "load_w": load,
+        parts.append({"name": f"RAM{gb}", "kind": "ram", "idle_w": idle, "load_w": load,
                       "count": modules, "note": "자동 감지"})
 
     ssd = sum(d["type"] == "SSD" for d in info.get("disks", []))
     hdd = sum(d["type"] == "HDD" for d in info.get("disks", []))
     if ssd:
-        parts.append({"name": "SSD", "idle_w": 1, "load_w": 5, "count": ssd, "note": "자동 감지"})
+        parts.append({"name": "SSD", "kind": "ssd", "idle_w": 1, "load_w": 5, "count": ssd,
+                      "note": "자동 감지"})
     if hdd:
-        parts.append({"name": "HDD", "idle_w": 5, "load_w": 9, "count": hdd, "note": "자동 감지"})
+        parts.append({"name": "HDD", "kind": "hdd", "idle_w": 5, "load_w": 9, "count": hdd,
+                      "note": "자동 감지"})
 
     if not laptop:
-        parts.append({"name": "케이스 팬", "idle_w": 1, "load_w": 3, "count": 3,
+        parts.append({"name": "케이스 팬", "kind": "fan", "idle_w": 1, "load_w": 3, "count": 3,
                       "note": "감지 불가 · 개수 확인"})
-
-    for mon in info.get("monitors", []):
-        idle, load = monitor_watts(mon.get("inches"))
-        label = f"{mon['inches']:.0f}인치 모니터" if mon.get("inches") else "모니터 (크기 미확인)"
-        parts.append({"name": label, "idle_w": idle, "load_w": load, "external": True,
-                      "note": "자동 감지"})
     return parts
+
+
+def build_monitors(info):
+    """감지된 외부 모니터를 모니터 사양 목록으로 바꾼다."""
+    specs = []
+    for mon in info.get("monitors", []):
+        size = mon.get("inches") or 27
+        name = mon.get("name") or (f"{size:.0f}인치 모니터" if mon.get("inches")
+                                   else "모니터 (크기 미확인)")
+        specs.append(monitor.make_spec(
+            size=round(size, 1), resolution=mon.get("resolution") or "1920x1080",
+            refresh=mon.get("refresh") or 60,
+            panel="OLED" if "OLED" in name.upper() else "LCD",
+            brightness=mon.get("brightness") if mon.get("brightness") is not None else 70,
+            name=name))
+    return specs
